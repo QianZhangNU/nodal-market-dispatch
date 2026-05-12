@@ -1,7 +1,72 @@
 """
 DC Power Flow Network Model (topology-agnostic)
 =================================================
-Builds PTDF and LODF from arbitrary bus/line dicts passed as arguments.
+High-level view
+---------------
+This module converts a topology dictionary into the linear network matrices used
+by the dispatch, unit commitment, and auction solvers. It is not tied to ERCOT or
+to any specific example system: buses, lines, slack bus, and contingencies are
+all passed in by the caller.
+
+The model uses the standard DC power flow approximation:
+
+  - voltage magnitudes are fixed,
+  - reactive power and losses are ignored,
+  - line flow is linear in bus voltage angles,
+  - and net injections must be interpreted relative to the selected slack bus.
+
+The main output is a PTDF matrix that maps bus net injections to line flows. The
+module also builds LODF values and contingency PTDF matrices so downstream
+solvers can test line outages without rebuilding the network each time.
+
+Technical expression
+--------------------
+Sets and inputs:
+
+  B              buses
+  L              transmission lines
+  r              slack bus
+  l = (i, j)     directed line from bus i to bus j
+  b_l            line susceptance, from line["b_pu"]
+  p_b            net injection at bus b
+
+Build the bus susceptance matrix Bbus from each line l = (i, j):
+
+  Bbus[i, i] += b_l
+  Bbus[j, j] += b_l
+  Bbus[i, j] -= b_l
+  Bbus[j, i] -= b_l
+
+Remove the slack bus row and column, invert the reduced matrix, and embed the
+result back into a full matrix X with the slack row and column set to zero:
+
+  X[N, N] = inverse(Bbus[N, N]), where N = B \ {r}
+  X[r, :] = 0
+  X[:, r] = 0
+
+For each directed line l = (i, j), the PTDF row is:
+
+  PTDF[l, b] = b_l * (X[i, b] - X[j, b])
+
+Line flows for a vector of bus net injections p are:
+
+  f_l = sum_b PTDF[l, b] * p_b
+  f   = PTDF * p
+
+For an outage of line k = (m, n), the LODF denominator is:
+
+  denom_k = 1 - (PTDF[k, m] - PTDF[k, n])
+
+and the LODF values are:
+
+  LODF[k, k] = -1
+  LODF[l, k] = (PTDF[l, m] - PTDF[l, n]) / denom_k, for l != k
+
+The contingency PTDF for outage k adjusts every monitored line l by the outage
+line's pre-contingency flow sensitivity:
+
+  PTDF_ctg[k][l, b] = PTDF[l, b] + LODF[l, k] * PTDF[k, b]
+  PTDF_ctg[k][k, b] = 0
 """
 
 import numpy as np

@@ -1,34 +1,99 @@
 """
 CRR Auction Clearing Solver (topology-agnostic)
-=================================================
+===============================================
 Social-welfare-maximizing LP with Simultaneous Feasibility Test (SFT).
 
-Supports four bid types reflecting real ERCOT CRR auction structure:
+Supports four bid types:
 
-  BUY  OBL — Buyer acquires obligation CRR. Settled at DART (can be negative).
-             Uses SFT capacity in BOTH directions (source→sink and sink→source).
-  BUY  OPT — Buyer acquires option CRR. Settled at max(DART, 0).
-             Uses SFT capacity only in source→sink direction.
-  SELL OBL — Seller returns/offers obligation CRR. Releases SFT capacity.
-  SELL OPT — Seller returns/offers option CRR. Releases one-directional capacity.
+  BUY OBL
+      Buyer acquires an obligation CRR. It is settled at DART, so payoff can
+      be positive or negative. It uses SFT capacity in both directions.
 
-SFT treatment:
-  OBL: contributes to SFT in both directions (flow can go either way)
-       Σ MW_obl[k] · path_PTDF[l,k]  ≤  α·F_max   (forward)
-      -Σ MW_obl[k] · path_PTDF[l,k]  ≤  α·F_max   (reverse)
+  BUY OPT
+      Buyer acquires an option CRR. It is settled at max(DART, 0), so payoff
+      is never negative. It uses only positive source-to-sink SFT exposure.
 
-  OPT: contributes to SFT only when path_PTDF > 0 for that line
-       (because option holder will only exercise when DART > 0,
-        which means flow goes source→sink direction)
-       Σ MW_opt[k] · max(path_PTDF[l,k], 0)  ≤  α·F_max   (forward only)
+  SELL OBL
+      Seller returns/offers obligation CRR capacity and releases signed SFT
+      capacity in both directions.
 
-Clearing prices:
-  OBL ACP = shadow[sink] - shadow[source]  (can be negative)
-  OPT ACP = max(shadow[sink] - shadow[source], 0) + option_premium
-            Option premium comes from the asymmetric payoff structure.
+  SELL OPT
+      Seller returns/offers option CRR capacity and releases only the positive
+      source-to-sink option exposure.
 
-All topology data passed as arguments — no hardcoded network.
+At a high level, the LP chooses awarded MW for each bid/offer to maximize
+buyer value minus seller reservation cost, while keeping all awarded CRRs
+simultaneously feasible on the transmission network.
+
+Optimization problem solved by clear_auction
+============================================
+
+Sets:
+  I: CRR bid/offer rows, L: transmission lines, B: buses.
+
+Decision variables:
+  x[i] >= 0: awarded MW for bid/offer row i.
+
+Bid/path data:
+  side[i] in {BUY, SELL}
+  type[i] in {OBL, OPT}
+  source[i]: source settlement point name for row i
+  sink[i]: sink settlement point name for row i
+  price[i]: buyer bid price or seller reservation price ($/MW)
+  cap[i]: maximum bid/offer MW
+
+Settlement-point injection vectors:
+  e_src[i,b] = injection weight at bus b for source[i]
+  e_snk[i,b] = injection weight at bus b for sink[i]
+
+  For a resource node or single-bus load zone, the vector has 1.0 at its bus.
+  For a weighted load zone, the vector uses its member-bus weights.
+  For a hub, the vector averages equally across its member buses.
+
+Source-to-sink path exposure:
+  net_inj[i,b] = e_snk[i,b] - e_src[i,b]
+  path_ptdf[l,i] = sum_b PTDF[l,b] * net_inj[i,b]
+  ptdf_obl[l,i] = path_ptdf[l,i]
+  ptdf_opt[l,i] = max(path_ptdf[l,i], 0)
+
+Objective:
+  maximize
+      sum_{i: BUY}  price[i] * x[i]
+    - sum_{i: SELL} price[i] * x[i]
+
+  scipy.linprog minimizes the equivalent negative objective:
+     -sum_{BUY} price[i] * x[i] + sum_{SELL} price[i] * x[i].
+
+Bounds:
+  0 <= x[i] <= cap[i]
+
+SFT constraints for each line l:
+  Let F_l = capacity_factor * flow_limit[l].
+  Let base[l] be signed flow from pre-existing baseload CRRs.
+
+  Forward:
+      sum_i a_fwd[l,i] * x[i] <= F_l - base[l]
+
+  Reverse:
+      sum_i a_rev[l,i] * x[i] <= F_l + base[l]
+
+  Column coefficients:
+      BUY  OBL: a_fwd = +ptdf_obl, a_rev = -ptdf_obl
+      SELL OBL: a_fwd = -ptdf_obl, a_rev = +ptdf_obl
+      BUY  OPT: a_fwd = +ptdf_opt, a_rev = 0
+      SELL OPT: a_fwd = -ptdf_opt, a_rev = 0
+
+Dual prices and ACPs:
+  mu_fwd[l] and mu_rev[l] are the nonnegative SFT shadow prices from
+  the forward and reverse line constraints.
+
+  bus_shadow[b] = sum_l (mu_fwd[l] - mu_rev[l]) * PTDF[l,b]
+  sp_shadow[s]  = inj(s) @ bus_shadow
+
+  OBL ACP(i) = sp_shadow[sink[i]] - sp_shadow[source[i]]
+  OPT ACP(i) = sum_l mu_fwd[l] * ptdf_opt[l,i]
 """
+
 
 import numpy as np
 import pandas as pd
@@ -113,13 +178,17 @@ def clear_auction(
         bids["crr_type"] = "OBL"
 
     # ── 1. Build PATH_PTDF for each bid ──────────────────────────────────
-    path_ptdf = np.zeros((n_lines, n_bids))
+    # OBL uses signed source-to-sink path PTDF. OPT uses only positive
+    # source-to-sink capacity exposure.
+    ptdf_obl = np.zeros((n_lines, n_bids))
+    ptdf_opt = np.zeros((n_lines, n_bids))
     for k, row in bids.iterrows():
         snk_inj = _settlement_point_injection(row["sink"], settlement_points,
                                                bus_list, bus_idx)
         src_inj = _settlement_point_injection(row["source"], settlement_points,
                                                bus_list, bus_idx)
-        path_ptdf[:, k] = ptdf @ (snk_inj - src_inj)
+        ptdf_obl[:, k] = ptdf @ (snk_inj - src_inj)
+        ptdf_opt[:, k] = np.maximum(ptdf_obl[:, k], 0.0)
 
     # ── 2. Objective: maximize social welfare ────────────────────────────
     c = np.zeros(n_bids)
@@ -157,29 +226,30 @@ def clear_auction(
         row_rev = np.zeros(n_bids)
 
         for k, bid in bids.iterrows():
-            pp = path_ptdf[l_idx, k]
+            pp_obl = ptdf_obl[l_idx, k]
+            pp_opt = ptdf_opt[l_idx, k]
             side = bid["side"]
             ctype = bid["crr_type"]
 
             if side == "BUY":
                 if ctype == "OBL":
                     # OBL: capacity used in both directions
-                    row_fwd[k] = pp
-                    row_rev[k] = -pp
+                    row_fwd[k] = pp_obl
+                    row_rev[k] = -pp_obl
                 else:  # OPT
                     # OPT: capacity used only in positive flow direction
                     # Option holder exercises only when DART > 0 → flow source→sink
-                    row_fwd[k] = max(pp, 0)
-                    row_rev[k] = max(-pp, 0)
+                    row_fwd[k] = pp_opt
+                    row_rev[k] = 0.0
             else:  # SELL
                 if ctype == "OBL":
                     # Selling OBL releases capacity in both directions
-                    row_fwd[k] = -pp
-                    row_rev[k] = pp
+                    row_fwd[k] = -pp_obl
+                    row_rev[k] = pp_obl
                 else:  # OPT
                     # Selling OPT releases capacity in positive direction only
-                    row_fwd[k] = -max(pp, 0)
-                    row_rev[k] = -max(-pp, 0)
+                    row_fwd[k] = -pp_opt
+                    row_rev[k] = 0.0
 
         A_ub_rows.append(row_fwd)
         b_ub_rows.append(eff_limit - baseload_flow[l_idx])
@@ -245,9 +315,13 @@ def clear_auction(
                 # OBL: can be negative (holder pays when DART < 0)
                 acp_by_path[key] = obl_acp
             else:  # OPT
-                # OPT: always ≥ 0 (holder never exercises at a loss)
-                # Option value ≥ intrinsic value = max(obl_acp, 0)
-                acp_by_path[key] = max(obl_acp, 0)
+                # OPT: price positive SFT exposure directly from constraint duals.
+                # This is not the same as clipping the OBL ACP at zero.
+                opt_ptdf = ptdf_opt[:, int(row.name)]
+                opt_acp = 0.0
+                for l_idx, line_id in enumerate(line_list):
+                    opt_acp += line_duals[line_id]["forward"] * opt_ptdf[l_idx]
+                acp_by_path[key] = opt_acp
 
     awarded_df["clearing_price"] = awarded_df.apply(
         lambda r: acp_by_path.get((r["source"], r["sink"], r["crr_type"]), 0),

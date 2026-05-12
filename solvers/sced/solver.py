@@ -1,30 +1,71 @@
 """
-Hourly SCED Solver v2  (with GTC + Battery)
-=============================================
-Same KKT-based LMP extraction as v1, with two additions:
+Hourly SCED Solver (single-hour LP)
+===================================
+This module implements a topology-agnostic Security-Constrained Economic
+Dispatch (SCED) model for one operating hour. Unit commitment is fixed from
+SCUC, while dispatch is re-optimized against load, generator availability,
+ramp limits, optional DC network constraints, optional GTC constraints, and
+exogenous battery net injection.
 
-1. GTC constraints: Σ (sign · line_flow) ≤ gtc_limit
-   These produce a single shadow price μ_GTC which contributes to LMP at
-   every bus via:
-       LMP_GTC[bus] = μ_GTC × Σ_l (sign_l × ptdf[l, bus])
+The battery profile is treated as fixed input: battery generation reduces
+effective load and battery charging increases effective load. This model does
+not co-optimize battery dispatch.
 
-2. Battery net injection: each bus's effective load is:
-       effective_load[bus] = bus_load[bus] - battery_injection[bus]
-   (Battery generation reduces effective load; battery charging increases it.)
+Optimization problem solved by solve_hourly_sced
+================================================
 
-This is a price-taker model: battery dispatch is exogenous to the LP,
-fed in as a fixed boundary condition. This is realistic for 2025 ERCOT
-where most batteries are bid in by aggregators based on price forecasts
-rather than co-optimized.
+Sets:
+  G: generators, B: buses, L: transmission lines, K: GTC constraints.
+
+Inputs:
+  u[g]       : fixed commitment from SCUC
+  p_prev[g]  : previous-hour dispatch, used only when ramping is enabled
+  D[b]       : effective load = load[b] - battery_injection[b]
+  Pmax[g]    : hour-specific generator availability
+  c[g]       : energy offer / marginal cost
+  PTDF[l,b]  : DC shift factor for line l at bus b
+
+Decision variables:
+  p[g] >= 0       : generator dispatch (MW)
+  shed >= 0       : load-shedding slack (MW)
+  s[l] >= 0       : line overload slack only for lines with ocost > 0
+
+Objective:
+  minimize
+      sum_g c[g] * p[g]
+    + SHED_PRICE * shed
+    + sum_{l with ocost} ocost[l] * s[l]
+
+Subject to:
+  [A] System balance:
+      sum_g p[g] + shed = sum_b D[b]
+
+  [B] Generator dispatch bounds:
+      Pmin[g] * u[g] <= p[g] <= Pmax[g] * u[g]
+
+  [C] DC line limits when use_network=True:
+      f[l] = sum_b PTDF[l,b] * (sum_{g at b} p[g] - D[b])
+      -flow_limit[l] <= f[l] <= flow_limit[l]                       no ocost
+      -flow_limit[l] - s[l] <= f[l] <= flow_limit[l] + s[l]          with ocost
+
+  [D] GTC limits when use_gtc=True:
+      q[k] = sum_{l in k} sign[k,l] * f[l]
+      -gtc_limit[k] <= q[k] <= gtc_limit[k]
+
+  [E] Ramp limits when use_ramp=True and u[g] = 1:
+      p[g] <= Pmax[g]                      if starting from offline
+      p[g] <= p_prev[g] + ramp_up[g]       otherwise
+      p[g] >= p_prev[g] - ramp_down[g]     if previously online
+
+LMP extraction:
+  The balance dual gives the energy component. Line and GTC duals are mapped
+  back to buses with PTDFs, then settlement-point LMPs are aggregated from
+  bus LMPs.
 """
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import linprog
-
-
-
-
 
 
 def solve_hourly_sced(
@@ -48,10 +89,7 @@ def solve_hourly_sced(
     use_ramp: bool = True,
     use_gtc: bool = True,
 ) -> dict:
-    """
-    Single-hour SCED LP (topology-agnostic).
-    All system data passed as arguments — no global imports.
-    """
+    
     if gtcs is None:
         gtcs = {}
 
@@ -69,7 +107,7 @@ def solve_hourly_sced(
         effective_load = load_h
 
     # ── Build LP ─────────────────────────────────────────────────────────────
-    SHED_PRICE = 9000.0
+    SHED_PRICE = 5000.0
     n_vars = n_gen + 1
     SHED_IDX = n_gen
 
@@ -78,14 +116,14 @@ def solve_hourly_sced(
         c[i] = float(cost_h[g])
     c[SHED_IDX] = SHED_PRICE
 
-    # Equality: power balance Σ p_g + shed = total_effective_load
+    # [A] Equality: power balance Σ p_g + shed = total_effective_load
     total_load = float(effective_load.sum())
     A_eq = np.zeros((1, n_vars))
     A_eq[0, :n_gen] = 1.0
     A_eq[0, SHED_IDX] = 1.0
     b_eq = np.array([total_load])
 
-    # Bounds
+    # [B] Bounds
     bounds = []
     for g in gen_list:
         gd = generators[g]
@@ -98,7 +136,7 @@ def solve_hourly_sced(
     b_ub_rows = []
     line_row_index = {}
 
-    # ── Line constraints with OCOST soft constraint (NEW) ──────────────────
+    # [C] Line constraints with OCOST soft constraint ──────────────────
     # For lines with OCOST defined, allow overload at penalty price OCOST_l
     # Adds N_LINES_WITH_OCOST extra slack variables.
     # μ_l is bounded above by OCOST_l (allows binding at controlled price).
@@ -147,7 +185,7 @@ def solve_hourly_sced(
                 b_ub_rows.append(f_max - load_offset)
             line_row_index[line_id] = (len(A_ub_rows) - 2, len(A_ub_rows) - 1)
 
-    # ── GTC constraints ─────────────────────────────────────────────────────
+    # [D] GTC constraints ─────────────────────────────────────────────────────
     # GTC: Σ_l (sign_l · flow_l) ≤ gtc_limit
     # Substituting flow_l = Σ_b ptdf[l,b] · (gen[b] - load[b]):
     # Σ_l sign_l · Σ_b ptdf[l,b] · (gen[b] - load[b]) ≤ gtc_limit
@@ -179,7 +217,7 @@ def solve_hourly_sced(
             b_ub_rows.append(gtc_limit - load_offset_total)
             gtc_row_index[gtc_id] = (len(A_ub_rows) - 2, len(A_ub_rows) - 1)
 
-    # ── Ramp constraints ─────────────────────────────────────────────────────
+    # [E] Ramp constraints ─────────────────────────────────────────────────────
     if use_ramp:
         for g in gen_list:
             gd = generators[g]

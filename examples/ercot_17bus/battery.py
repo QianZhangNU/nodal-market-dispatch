@@ -1,5 +1,5 @@
 """
-Battery Dispatch Profile Generator (v2)
+Battery Dispatch Profile Generator 
 =========================================
 Generates a deterministic battery dispatch profile that mirrors real
 2025 ERCOT battery operating patterns:

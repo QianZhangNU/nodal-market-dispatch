@@ -1,32 +1,95 @@
 """
-Daily SCUC Solver  (24-hour MIP)
-==================================
-Solves a single-day SCUC problem given:
-  - System state at start of day (which units are on/off, output level)
-  - Forecasted load + renewable Pmax(t) for next 24 hours
-  - Generator parameters (cost, ramp, min-up/down, etc.)
-  - Network constraints (ptdf, line limits, contingencies)
+Daily SCUC Solver (24-hour MIP)
+===============================
+This module implements a generic single-day Security-Constrained Unit
+Commitment (SCUC) model. It commits generators over a 24-hour horizon using
+three-part offers, ramp limits, minimum up/down times, spinning-reserve
+headroom as a percent of load, and optional DC network constraints.
 
-Returns:
-  - Commitment schedule u[g, h]  for h ∈ {1..24}
-  - Initial dispatch p[g, h] (will be updated by hourly SCED)
-  - Total expected cost
-  - End-of-day state for next-day initialization
+The model does not co-optimize ancillary services. The reserve constraint is a
+simple online headroom requirement used as a reliability proxy.
 
-Variable layout (flattened for scipy.optimize.milp):
-  [u_g0_h0, u_g0_h1, ..., u_gN_h23,  ← n_gen × 24  binary commitment
-   v_g0_h0, ...                        ← n_gen × 24  binary startup
-   w_g0_h0, ...                        ← n_gen × 24  binary shutdown
-   p_g0_h0, ...]                       ← n_gen × 24  continuous dispatch
+Inputs include:
+  - initial generator state before the day starts
+  - 24-hour bus load forecast
+  - 24-hour generator Pmax forecast, including renewable availability/outages
+  - 24-hour generator marginal costs
+  - generator parameters such as Pmin, Pmax, ramps, min up/down, startup cost
+  - optional PTDF-based line limits
+
+Returns include:
+  - commitment schedule u[g,h]
+  - startup and shutdown schedules v[g,h], w[g,h]
+  - initial hourly dispatch p[g,h], later refined by SCED
+  - total expected cost
+  - end-of-day generator state for the next SCUC day
+
+Optimization problem solved by solve_daily_scuc
+===============================================
+
+Sets:
+  G: generators, H = {0, ..., 23}: hours, B: buses, L: lines.
+
+Decision variables:
+  u[g,h] in {0,1}: commitment
+  v[g,h] in {0,1}: startup
+  w[g,h] in {0,1}: shutdown
+  p[g,h] >= 0    : generator dispatch (MW)
+  shed[h] >= 0   : load-shedding slack (MW)
+  ls[l,h] >= 0   : line-limit slack if use_network=True (MW)
+
+Variable layout before slack variables are appended for scipy.optimize.milp:
+  [u_g0_h0, ..., u_gN_h23,
+   v_g0_h0, ...,
+   w_g0_h0, ...,
+   p_g0_h0, ...]
+
+Objective:
+  minimize
+      sum_{h,g} (
+          cost_b[g,h] * p[g,h]
+        + cost_c[g]   * u[g,h]
+        + su_cost[g]  * v[g,h]
+        + sd_cost[g]  * w[g,h]
+      )
+    + 9000 * sum_h shed[h]
+    + 5000 * sum_{l,h} ls[l,h]        only when network constraints are used
+
+Subject to:
+  [A] Unit-transition logic:
+      v[g,h] - w[g,h] = u[g,h] - u[g,h-1], using initial u[g,-1]
+      v[g,h] + w[g,h] <= 1
+
+  [B] Dispatch limits:
+      Pmin[g] * u[g,h] <= p[g,h] <= Pmax[g,h] * u[g,h]
+
+  [C] Ramp limits:
+      p[g,0] - p0[g] <= ramp_up[g]   * u0[g]  + Pmax[g] * v[g,0]
+      p0[g] - p[g,0] <= ramp_down[g] * u[g,0] + Pmax[g] * w[g,0]
+      p[g,h] - p[g,h-1] <= ramp_up[g]   * u[g,h-1] + Pmax[g] * v[g,h]
+      p[g,h-1] - p[g,h] <= ramp_down[g] * u[g,h]   + Pmax[g] * w[g,h]
+
+  [D] Minimum up/down time, including residual initial-state obligations:
+      sum_{tau=h-UT[g]+1..h} v[g,tau] <= u[g,h]
+      sum_{tau=h-DT[g]+1..h} w[g,tau] <= 1 - u[g,h]
+
+  [E] System balance:
+      sum_g p[g,h] + shed[h] = sum_b load[b,h]
+
+  [F] Online reserve headroom:
+      sum_g (Pmax[g,h] * u[g,h] - p[g,h]) >= reserve_pct * sum_b load[b,h]
+
+  [G] DC line limits when use_network=True:
+      f[l,h] = sum_b PTDF[l,b] * (sum_{g at b} p[g,h] - load[b,h])
+      -flow_limit[l] - ls[l,h] <= f[l,h] <= flow_limit[l] + ls[l,h]
 """
+
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import milp, LinearConstraint, Bounds
 from scipy.sparse import lil_matrix, csc_matrix
 import time
-
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,9 +134,7 @@ def solve_daily_scuc(
 ) -> dict:
     """
     Solve 24-hour SCUC for one day.
-    When custom_lines is provided, uses those instead of global LINES dict
-    (enables monthly topology variation with outages and seasonal ratings).
-
+    
     Returns dict with:
         u_schedule  : DataFrame [24, n_gen]  binary commitment
         p_dispatch  : DataFrame [24, n_gen]  continuous dispatch (MW)
@@ -213,12 +274,12 @@ def solve_daily_scuc(
 
     # ── [E] System power balance: Σ_g p[g,h] + load_shed[h] = Σ_b D[b,h] ────
     # Add load-shedding slack: a "virtual generator" that can serve any load
-    # at a high penalty price ($9000/MWh ≈ ERCOT VOLL). This ensures feasibility
+    # at a high penalty price ($5000/MWh ≈ ERCOT VOLL). This ensures feasibility
     # during extreme stress and gives meaningful scarcity prices.
     # Layout: append load_shed[h] as last n_h variables
     n_existing_vars = n_vars
     n_vars_with_shed = n_vars + n_h
-    SHED_PRICE = 9000.0   # $/MWh — value of lost load proxy
+    SHED_PRICE = 5000.0   # $/MWh — value of lost load proxy
 
     # Extend objective
     c_ext = np.zeros(n_vars_with_shed)
@@ -263,9 +324,7 @@ def solve_daily_scuc(
     # decision robustness), NOT for shadow price extraction. SCED uses its own
     # separate OCOST values to determine actual market congestion prices.
     #
-    # Why this works:
-    #   - SCUC slack penalty $5000 >> any realistic dispatch savings
-    #     → SCUC will only "use" slack if absolutely needed for feasibility
+    # Rationale:
     #   - SCUC dispatch decisions (which units commit) are robust
     #   - SCED then re-solves with hard limits or true OCOST for accurate prices
     SCUC_LINE_PENALTY = 5000.0   # $/MW — high enough to deter unnecessary use

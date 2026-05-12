@@ -2,7 +2,6 @@
 DAM Simulation Runner — ERCOT 17-Bus Example
 ==============================================
 Wires topology-agnostic solvers with the ERCOT 17-bus example data.
-Demonstrates the clean separation: solvers know nothing about ERCOT.
 """
 
 import numpy as np

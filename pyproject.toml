@@ -1,0 +1,20 @@
+[project]
+name = "power-dispatch-solvers"
+version = "0.1.0"
+description = "DC-network-based dispatch, commitment, auction clearing, and topology visualization examples."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy==1.23.5",
+    "pandas==2.0.3",
+    "scipy==1.10.1",
+    "plotly==4.14.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==6.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
