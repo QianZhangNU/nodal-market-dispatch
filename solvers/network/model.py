@@ -1,8 +1,7 @@
 """
 DC Power Flow Network Model (topology-agnostic)
 =================================================
-High-level view
----------------
+
 This module converts a topology dictionary into the linear network matrices used
 by the dispatch, unit commitment, and auction solvers. It is not tied to ERCOT or
 to any specific example system: buses, lines, slack bus, and contingencies are
@@ -19,7 +18,7 @@ The main output is a PTDF matrix that maps bus net injections to line flows. The
 module also builds LODF values and contingency PTDF matrices so downstream
 solvers can test line outages without rebuilding the network each time.
 
-Technical expression
+Network Modeling
 --------------------
 Sets and inputs:
 
@@ -28,7 +27,7 @@ Sets and inputs:
   r              slack bus
   l = (i, j)     directed line from bus i to bus j
   c_l            positive DC branch coefficient, from line["b_pu"]
-  normally c_l = 1 / x_l for x_l > 0
+  normally c_l = 1 / x_pu for x_pu > 0
   p_b            net injection at bus b
 
 Build the bus susceptance matrix Bbus from each line l = (i, j):
@@ -38,13 +37,25 @@ Build the bus susceptance matrix Bbus from each line l = (i, j):
   Bbus[i, j] -= c_l
   Bbus[j, i] -= c_l
 
+Each line changes only these four matrix entries, so Bbus is sparse for large
+systems: most bus pairs are not directly connected and therefore have zero
+off-diagonal entries. This implementation uses dense NumPy arrays because the
+example systems are small. For large market-scale networks, the same stamping
+logic should be implemented with scipy.sparse matrices and sparse linear solves
+instead of forming a dense inverse.
+
 This is the positive Laplacian convention for the DC equation:
 
   p = Bbus * theta
 
-Some power-system texts call the physical series susceptance -1 / x_l. This
+Some power-system texts call the physical series susceptance -1 / x_pu. This
 code does not use that negative sign directly; it expects line["b_pu"] to be
-the positive DC coefficient 1 / x_l.
+the positive DC coefficient 1 / x_pu.
+
+Here, x_pu is the line series reactance in per-unit. A larger x_pu means the
+line is electrically weaker and carries less flow for the same angle
+difference. b_pu is the positive DC flow coefficient in per-unit, usually
+computed as 1 / x_pu, so a larger b_pu means the line is electrically stronger.
 
 Remove the slack bus row and column, invert the reduced matrix, and embed the
 result back into a full matrix X with the slack row and column set to zero:
@@ -57,10 +68,10 @@ For each directed line l = (i, j), the PTDF row is:
 
   PTDF[l, b] = c_l * (X[i, b] - X[j, b])
 
-Line flows for a vector of bus net injections p are:
+Line flows for a vector of bus net injections p with elements p_b are:
 
   f_l = sum_b PTDF[l, b] * p_b
-  f   = PTDF * p
+
 
 For an outage of line k = (m, n), the LODF denominator is:
 
