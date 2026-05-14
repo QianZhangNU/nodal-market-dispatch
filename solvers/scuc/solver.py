@@ -52,7 +52,7 @@ Objective:
         + su_cost[g]  * v[g,h]
         + sd_cost[g]  * w[g,h]
       )
-    + 9000 * sum_h shed[h]
+    + 5000 * sum_h shed[h]
     + 5000 * sum_{l,h} ls[l,h]        only when network constraints are used
 
 Subject to:

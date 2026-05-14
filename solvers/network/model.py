@@ -27,15 +27,24 @@ Sets and inputs:
   L              transmission lines
   r              slack bus
   l = (i, j)     directed line from bus i to bus j
-  b_l            line susceptance, from line["b_pu"]
+  c_l            positive DC branch coefficient, from line["b_pu"]
+  normally c_l = 1 / x_l for x_l > 0
   p_b            net injection at bus b
 
 Build the bus susceptance matrix Bbus from each line l = (i, j):
 
-  Bbus[i, i] += b_l
-  Bbus[j, j] += b_l
-  Bbus[i, j] -= b_l
-  Bbus[j, i] -= b_l
+  Bbus[i, i] += c_l
+  Bbus[j, j] += c_l
+  Bbus[i, j] -= c_l
+  Bbus[j, i] -= c_l
+
+This is the positive Laplacian convention for the DC equation:
+
+  p = Bbus * theta
+
+Some power-system texts call the physical series susceptance -1 / x_l. This
+code does not use that negative sign directly; it expects line["b_pu"] to be
+the positive DC coefficient 1 / x_l.
 
 Remove the slack bus row and column, invert the reduced matrix, and embed the
 result back into a full matrix X with the slack row and column set to zero:
@@ -46,7 +55,7 @@ result back into a full matrix X with the slack row and column set to zero:
 
 For each directed line l = (i, j), the PTDF row is:
 
-  PTDF[l, b] = b_l * (X[i, b] - X[j, b])
+  PTDF[l, b] = c_l * (X[i, b] - X[j, b])
 
 Line flows for a vector of bus net injections p are:
 
