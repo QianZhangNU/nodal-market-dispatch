@@ -53,7 +53,7 @@ tests/           Unit and smoke tests, including hand-checkable 3-bus cases
 From a Windows Command Prompt:
 
 ```cmd
-git clone <repo-url>
+git clone https://github.com/QianZhangNU/nodal-market-dispatch.git
 cd nodal-market-dispatch
 uv venv
 .venv\Scripts\activate.bat
@@ -109,18 +109,3 @@ Dependencies are managed with `uv`:
 - `pyproject.toml` lists direct runtime and dev dependencies.
 - `uv.lock` records the resolved package graph.
 
-Add a runtime package:
-
-```cmd
-uv add <package-name>
-uv run pytest
-```
-
-Add a dev-only package:
-
-```cmd
-uv add --optional dev <package-name>
-uv run pytest
-```
-
-Commit both `pyproject.toml` and `uv.lock` after dependency changes.
