@@ -3,9 +3,11 @@ ERCOT-Flavored 17-Bus Test System
 ========================================
 v2 upgrades inspired by Potomac Economics 2025 IMM data:
 
-  1. DOMINANT PATH: Tightened West Texas Export GTC limits to make
-     RN_WEST_AGG → LZ_WEST the highest-value CRR path in the system,
-     mirroring HB_WEST → LZ_WEST in real ERCOT (~60% of total OBL value).
+  1. WEST CONGESTION STRUCTURE: The West Export GTC limits total export
+     from West/Panhandle to the rest of ERCOT. It drives West-area congestion
+     versus the broader system, while the HB_WEST ↔ LZ_WEST basis is driven
+     by separate West intrazonal constraints between the gen-side hub buses
+     and the West load node.
 
   2. GENERIC TRANSMISSION CONSTRAINT (GTC): A "WEST_EXPORT_GTC" that
      limits the SUM of flows on multiple lines simultaneously, not any
@@ -304,14 +306,17 @@ LINES = {
         description="Panhandle wind export, parallel circuit",
     ),
     # Two parallel West intrazonal lines with UNEQUAL impedances + OCOST.
-    # OCOST allows controlled overload (caps μ at OCOST) so SCED produces
+    # These lines, not the West Export GTC, are the direct driver of
+    # HB_WEST vs LZ_WEST separation: HB_WEST averages gen-side buses 1/2,
+    # while LZ_WEST is the load node at bus 13 behind this local interface.
+    # OCOST allows controlled overload (caps mu at OCOST) so SCED produces
     # bounded LMP differentials reflecting realistic intrazonal premium.
     # SCUC's slack mechanism handles infeasibility separately.
     "L_WEST_INTRAZONAL_1": dict(
         from_bus=2, to_bus=13, kV=138, x_pu=0.080, b_pu=12.5,
         flow_limit=300, contingency_limit=240,
-        ocost=15,    # When binds, μ capped at $15/MW → realistic LZ_WEST premium
-        description="West intrazonal main (lower x). OCOST=$15 caps μ at realistic level.",
+        ocost=15,    # When binds, mu capped at $15/MW -> realistic LZ_WEST premium
+        description="West intrazonal main (lower x). OCOST=$15 caps mu at realistic level.",
     ),
     "L_WEST_INTRAZONAL_2": dict(
         from_bus=2, to_bus=13, kV=138, x_pu=0.180, b_pu=5.6,
@@ -846,4 +851,3 @@ def print_monthly_topology_summary(year: int, month: int):
             print(f"  {lid}: {orig} → {new} MW")
         elif lid in LINES:
             print(f"  {lid}: OUTAGED this month")
-
