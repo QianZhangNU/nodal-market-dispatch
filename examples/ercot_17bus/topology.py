@@ -1,28 +1,62 @@
 """
 ERCOT-Flavored 17-Bus Test System
-========================================
-v2 upgrades inspired by Potomac Economics 2025 IMM data:
+================================
+This file defines a small ERCOT-style test system for studying nodal price
+formation, congestion, CRR path exposure, and dispatch behavior. It is not a
+full ERCOT network model. Instead, it is a deliberately compact 17-bus system
+with enough structure to reproduce several important market mechanisms in a
+transparent and inspectable way.
 
-  1. WEST CONGESTION STRUCTURE: The West Export GTC limits total export
-     from West/Panhandle to the rest of ERCOT. It drives West-area congestion
-     versus the broader system, while the HB_WEST ↔ LZ_WEST basis is driven
-     by separate West intrazonal constraints between the gen-side hub buses
-     and the West load node.
+Design goals
+------------
+1. Keep the model small enough for fast SCUC/SCED and hand inspection.
+   The system uses representative buses for major ERCOT areas.
 
-  2. GENERIC TRANSMISSION CONSTRAINT (GTC): A "WEST_EXPORT_GTC" that
-     limits the SUM of flows on multiple lines simultaneously, not any
-     single line. This is what creates persistent multi-month congestion
-     patterns in real ERCOT (e.g., WEST TEXAS EXPORT GTC bound 9 of 11
-     months in 2025 with $86M congestion rent).
+2. Preserve nodal behavior.
+   Hubs, load zones, resource nodes, local load pockets, and constrained
+   interfaces are modeled separately so the example can produce hub-zone basis,
+   congestion components, and source-sink CRR exposure.
 
-  3. BATTERY STORAGE: 4 battery units totaling 600 MW. Modeled as
-     time-varying load/generation profile (charge in midday solar peak,
-     discharge in evening peak). This creates the "evening peak shave"
-     phenomenon that is reshaping CRR economics in 2025 (real ERCOT
-     battery generation in HE 17-20 doubled from 2024 to 2025).
+3. Make congestion drivers explicit.
+   Constraints are named and shaped so users can trace price separation back to
+   a physical modeling assumption: a line limit, a GTC, an outage, a local load
+   pocket, or a generation pocket.
 
-The rest of the topology (12 buses, line layout) is preserved from v1
-to maintain compatibility with all existing modules.
+Main modeled congestion structures
+----------------------------------
+West export congestion:
+  GTC_WEST_EXPORT limits total export from West/Panhandle toward the rest of
+  ERCOT. This represents broad West-area export congestion. It affects West
+  prices versus the rest of the system, but it is not the direct driver of
+  HB_WEST versus LZ_WEST separation.
+
+West intrazonal basis:
+  HB_WEST is represented by gen-side buses 1 and 2, while LZ_WEST is represented
+  by the West load node at bus 13. The two parallel West intrazonal lines from
+  bus 2 to bus 13 create the local interface behind which LZ_WEST can separate
+  from HB_WEST. The expensive West peaker at bus 13 provides a local marginal
+  resource when that interface is tight.
+
+Houston import congestion:
+  GTC_HOUSTON_IMPORT and individual Houston import lines model load-pocket
+  congestion into the Houston area. This creates price separation when Houston
+  load is high or import paths are limited.
+
+South Texas/RGV export congestion:
+  The RGV solar pocket, Laredo solar node, and GTC_SOUTH_TEXAS_EXPORT create a
+  generation-pocket structure similar to real South Texas export constraints.
+  This lets the example produce solar-driven congestion and curtailment risk.
+
+Storage behavior:
+  Four battery units are represented as exogenous net-injection profiles rather
+  than co-optimized SCUC/SCED resources. They charge during midday solar-heavy
+  hours and discharge during evening peak hours, allowing the example to show
+  how storage can reshape net load and congestion patterns.
+
+Monthly topology variation:
+  get_monthly_topology() applies seasonal ratings, line outages, generator
+  outages, and GTC limit adjustments. This supports scenario analysis for CRR
+  and congestion studies without changing the base topology definitions.
 """
 
 import numpy as np
@@ -171,7 +205,10 @@ GENERATORS = {
         Pmin=100, Pmax=550, cost_b=36.0, cost_c=250,
         su_cost=4000, sd_cost=1000, min_up=4, min_down=3,
         ramp_up=220, ramp_down=220,
-        init_status=1, init_gen=250, init_up_time=12, init_down_time=0,
+        # init_status=0: keeps sum(Pmin of committed units)=2220 MW < 2253 MW
+        # minimum system load (Jan 27), preventing overgeneration infeasibility
+        # that would force nuclear offline on day 1.
+        init_status=0, init_gen=0, init_up_time=0, init_down_time=4,
     ),
     "CC_NORTH_001": dict(
         bus=3, type="COMBINED_CYCLE", region="North",
@@ -235,7 +272,14 @@ GENERATORS = {
     "NUC_SOUTH_001": dict(
         bus=8, type="NUCLEAR", region="South",
         Pmin=1100, Pmax=1200, cost_b=8.0, cost_c=2000,
-        su_cost=100000, sd_cost=50000, min_up=720, min_down=168,
+        su_cost=100000, sd_cost=50000,
+        # min_up=17520: once committed, nuclear cannot decommit for 2 full years.
+        # This covers the entire 2023-2024 simulation span. Using 8760 (1 year)
+        # caused the must-on constraint to expire mid-simulation (up_time exceeds
+        # min_up after accumulated elapsed hours), allowing economic decommit.
+        # Plants cycle only for planned refueling (modeled via planned outage in
+        # get_monthly_topology). After an outage the restart is handled in run_dam.
+        min_up=17520, min_down=168,
         ramp_up=50, ramp_down=50,
         init_status=1, init_gen=1180, init_up_time=720, init_down_time=0,
     ),
@@ -333,11 +377,13 @@ LINES = {
     "L_WEST_SOUTH": dict(
         from_bus=2, to_bus=8, kV=345, x_pu=0.045, b_pu=22.2,
         flow_limit=600, contingency_limit=450,
+        ocost=200,
         description="Permian to South Texas",
     ),
     "L_NORTH_NCNTRL": dict(
         from_bus=3, to_bus=4, kV=345, x_pu=0.020, b_pu=50.0,
         flow_limit=1200, contingency_limit=950,
+        ocost=150,
         description="DFW to coal plants",
     ),
     "L_NCNTRL_HOUSTON": dict(
@@ -375,36 +421,43 @@ LINES = {
     "L_SOUTH_SOUTHERN": dict(
         from_bus=8, to_bus=9, kV=345, x_pu=0.050, b_pu=20.0,
         flow_limit=500, contingency_limit=380,
+        ocost=100,
         description="Corpus to RGV/border",
     ),
     "L_HOULOAD_HOUGEN": dict(
         from_bus=6, to_bus=7, kV=138, x_pu=0.060, b_pu=16.7,
         flow_limit=600, contingency_limit=450,
+        ocost=150,
         description="Houston load to coastal gen",
     ),
     "L_NCNTRL_WACO": dict(
         from_bus=4, to_bus=11, kV=138, x_pu=0.080, b_pu=12.5,
         flow_limit=400, contingency_limit=300,
+        ocost=100,
         description="Coal to Waco",
     ),
     "L_WACO_AUSTIN": dict(
         from_bus=11, to_bus=10, kV=138, x_pu=0.090, b_pu=11.1,
         flow_limit=350, contingency_limit=270,
+        ocost=50,
         description="Waco to Austin",
     ),
     "L_AUSTIN_VICTORIA": dict(
         from_bus=10, to_bus=12, kV=138, x_pu=0.100, b_pu=10.0,
         flow_limit=350, contingency_limit=270,
+        ocost=50,
         description="Austin to South interconnect",
     ),
     "L_VICTORIA_HOULOAD": dict(
         from_bus=12, to_bus=6, kV=138, x_pu=0.080, b_pu=12.5,
         flow_limit=400, contingency_limit=300,
+        ocost=200,
         description="Victoria to Houston load",
     ),
     "L_VICTORIA_SOUTH": dict(
         from_bus=12, to_bus=8, kV=138, x_pu=0.075, b_pu=13.3,
         flow_limit=450, contingency_limit=350,
+        ocost=100,
         description="Victoria to Corpus",
     ),
 
@@ -419,6 +472,7 @@ LINES = {
     "L_RGV_TO_LAREDO": dict(
         from_bus=14, to_bus=17, kV=138, x_pu=0.060, b_pu=16.7,
         flow_limit=500, contingency_limit=400,
+        ocost=30,
         description="RGV → Laredo cross-tie",
     ),
     "L_LAREDO_TO_SOUTH": dict(

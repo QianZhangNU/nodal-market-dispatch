@@ -80,22 +80,54 @@ def run_dam_simulation(fast_mode=True, verbose=True, save_path=None):
 
     state = build_initial_state(GENERATORS)
     current_month = None
+    mt = None
     nm = None
     m_lines = m_gens = m_gtcs = m_llist = None
+    prev_day = None         # track last simulated day for elapsed-time correction
+    prev_outaged_gens = []  # generators outaged in the previous topology month
 
     for day_idx, day in enumerate(days):
         day_start = pd.Timestamp(day)
         day_hours = pd.date_range(day_start, periods=24, freq="h")
 
+        # Adjust up_time/down_time for hours that elapsed between the end of the
+        # previous simulated day and the start of this one. In fast mode the gap
+        # can span weeks or months; without this correction min_down=168 (nuclear)
+        # never clears between non-consecutive simulated days.
+        if prev_day is not None:
+            hours_gap = int((day_start - prev_day).total_seconds() / 3600) - 24
+            if hours_gap > 0:
+                for g in GEN_LIST:
+                    if state[g]["u"] == 1:
+                        state[g]["up_time"] += hours_gap
+                    else:
+                        state[g]["down_time"] += hours_gap
+        prev_day = day_start
+
         # Monthly topology switch
         mk = (day_start.year, day_start.month)
         if mk != current_month:
             current_month = mk
+            prev_outaged_gens = mt["outaged_generators"] if mt is not None else []
             mt = get_monthly_topology(*mk)
             m_lines, m_gens, m_gtcs = mt["lines"], mt["generators"], mt["gtcs"]
             m_llist = list(m_lines.keys())
             nm = NetworkModel(buses=BUSES, lines=m_lines, slack_bus=SLACK_BUS,
                               contingencies=mt["contingencies"])
+
+            # Restart generators returning from a planned outage. In the rolling
+            # 24-hour SCUC, the su_cost alone cannot justify restarting a large
+            # baseload unit (e.g., nuclear) for a single simulation day, even when
+            # it is the cheapest available source. Forcing an explicit restart here
+            # reflects real-world operator practice: nuclear units return to service
+            # on a pre-committed schedule, not via day-ahead economic dispatch.
+            for g in prev_outaged_gens:
+                if g in mt["generators"] and state[g]["u"] == 0:
+                    gd = GENERATORS[g]
+                    state[g] = {"u": 1, "p": gd["Pmin"],
+                                "up_time": 1, "down_time": 0}
+                    if verbose:
+                        print(f"  [{mk[0]}-{mk[1]:02d}] Restarting {g} after planned outage")
             if verbose:
                 out = ""
                 if mt["outaged_lines"]:
@@ -114,6 +146,14 @@ def run_dam_simulation(fast_mode=True, verbose=True, save_path=None):
         for g in GEN_LIST:
             if g not in m_gens:
                 pmax_24h[g] = 0.0
+
+        # Generators on planned outage (pmax=0) must be forced to u=0 in the
+        # initial state before SCUC. Otherwise a high up_time combined with a
+        # min_up=17520 must-on constraint would conflict with the pmax=0 upper
+        # bound, making the SCUC MIP infeasible.
+        for g in GEN_LIST:
+            if g not in m_gens and state[g]["u"] == 1:
+                state[g] = {"u": 0, "p": 0, "up_time": 0, "down_time": 1}
 
         eff_load = load_24h - bat_24h.reindex(columns=load_24h.columns, fill_value=0)
 

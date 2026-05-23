@@ -213,14 +213,16 @@ def generate_solar_profile(seed: int = 44) -> pd.DataFrame:
         hour = feats["hour"].values
         doy = feats["doy"].values
 
-        # Daylight hours (CDT): roughly HE 7 to HE 20 in summer, HE 8 to HE 18 in winter
-        # Solar elevation proxy: peak at HE 13-14
-        clear_sky = np.clip(
-            0.85 * np.cos(np.pi * (hour - 13.5) / 7.5)**2,
-            0, 1
-        )
-        # Zero out night hours
-        clear_sky[(hour < 7) | (hour > 20)] = 0
+        # Daylight hours (CDT): roughly HE 7 to HE 20.
+        # Use a single sine bell over the daylight window. Avoid cos(...)**2
+        # here: squared cosine has multiple lobes over this interval and can
+        # create artificial morning/noon/evening solar peaks.
+        daylight_start = 7.0
+        daylight_end = 20.0
+        daylight_span = daylight_end - daylight_start
+        solar_phase = (hour - daylight_start) / daylight_span
+        clear_sky = 0.85 * np.sin(np.pi * np.clip(solar_phase, 0, 1))
+        clear_sky[(hour < daylight_start) | (hour > daylight_end)] = 0
 
         # Seasonal: longer + brighter in summer
         seasonal = 1.0 + 0.15 * np.sin((doy - 80) / 365 * 2 * np.pi)

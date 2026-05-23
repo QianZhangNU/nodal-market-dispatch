@@ -50,11 +50,32 @@ Settlement-point injection vectors:
   For a weighted load zone, the vector uses its member-bus weights.
   For a hub, the vector averages equally across its member buses.
 
-Source-to-sink path exposure:
-  net_inj[i,b] = e_snk[i,b] - e_src[i,b]
-  path_ptdf[l,i] = sum_b PTDF[l,b] * net_inj[i,b]
-  ptdf_obl[l,i] = path_ptdf[l,i]
-  ptdf_opt[l,i] = max(path_ptdf[l,i], 0)
+Source-to-sink path exposure  (result: matrix of shape n_lines × n_bids)
+  Index key for this block:
+    l ∈ L : transmission line index (row)
+    i ∈ I : bid/offer index — one CRR instrument with a source→sink path (column)
+    b ∈ B : bus index
+
+  net_inj[i,b]   = injection weight at bus b when 1 MW flows on bid-i path
+                 = e_snk[i,b] - e_src[i,b]
+                   (positive at sink buses, negative at source buses)
+
+  path_ptdf[l,i] = DC power flow on line l induced by 1 MW awarded to bid i
+                 = sum_b PTDF[l,b] * net_inj[i,b]
+                 = ptdf[l,:] @ (snk_inj[i] - src_inj[i])
+                   (positive = flow in line's from→to direction)
+                   Lines l and bids i are independent dimensions; every
+                   (l, i) entry quantifies how much of line l's capacity is
+                   consumed per MW of bid i.
+
+  ptdf_obl[l,i]  = path_ptdf[l,i]
+                   OBL uses signed exposure: the CRR consumes capacity in the
+                   forward direction and releases it in the reverse direction.
+
+  ptdf_opt[l,i]  = max(path_ptdf[l,i], 0)
+                   OPT uses only forward (positive) exposure: the holder
+                   exercises only when flow goes source→sink (DART > 0), so
+                   reverse capacity is never consumed.
 
 Objective:
   maximize
@@ -337,6 +358,184 @@ def clear_auction(
             key = f"{side.lower()}_{ctype.lower()}"
             summary[f"{key}_mw"] = float(subset["mw_awarded"].sum())
             summary[f"{key}_n"] = int((subset["mw_awarded"] > 0.01).sum())
+
+    return {
+        "status":        "optimal",
+        "awarded":       awarded_df,
+        "sp_shadow":     sp_shadow,
+        "bus_shadow":    bus_shadow,
+        "acp_by_path":   acp_by_path,
+        "line_duals":    line_duals,
+        "binding_lines": binding_lines,
+        "total_welfare": float(-res.fun),
+        "summary":       summary,
+    }
+
+
+def clear_auction_vectorize(
+    bids_df: pd.DataFrame,
+    ptdf: np.ndarray,
+    lines: Dict[str, dict],
+    line_list: List[str],
+    bus_list: List[Any],
+    bus_idx: Dict[Any, int],
+    settlement_points: Dict[str, dict],
+    capacity_factor: float = 0.90,
+    baseload_crrs: Optional[List[Tuple]] = None,
+) -> dict:
+    """
+    Vectorized CRR auction clearing — identical results to clear_auction, lower runtime.
+
+    Key differences from clear_auction:
+      - path_ptdf built via one batched matmul  ptdf @ net_inj.T  (BLAS-3)
+        instead of n_bids separate matrix-vector products (n_bids × BLAS-1).
+      - SFT constraint matrix assembled with NumPy broadcasting, eliminating
+        the O(n_lines × n_bids) nested Python loop.
+      - Bus shadow prices computed as  mu_net @ ptdf  (one matmul).
+      - SP shadow prices computed as  sp_inj_mat @ bus_shadow  (one matmul).
+      - OPT ACPs for all bids computed as  mu_fwd @ ptdf_opt  (one matmul).
+    """
+    n_bids  = len(bids_df)
+    n_lines = len(line_list)
+    n_bus   = len(bus_list)
+
+    if n_bids == 0:
+        return {"status": "no_bids", "awarded": pd.DataFrame()}
+
+    bids = bids_df.reset_index(drop=True).copy()
+    if "crr_type" not in bids.columns:
+        bids["crr_type"] = "OBL"
+
+    source_names = bids["source"].tolist()
+    sink_names   = bids["sink"].tolist()
+
+    # ── 1. Build injection matrices, then path_ptdf in one batched matmul ────
+    # snk_mat / src_mat : (n_bids, n_bus) — one row per bid
+    snk_mat = np.zeros((n_bids, n_bus))
+    src_mat = np.zeros((n_bids, n_bus))
+    for k in range(n_bids):
+        snk_mat[k] = _settlement_point_injection(
+            sink_names[k],   settlement_points, bus_list, bus_idx)
+        src_mat[k] = _settlement_point_injection(
+            source_names[k], settlement_points, bus_list, bus_idx)
+
+    net_inj  = snk_mat - src_mat          # (n_bids, n_bus)
+    ptdf_obl = ptdf @ net_inj.T           # (n_lines, n_bids) — single BLAS-3 call
+    ptdf_opt = np.maximum(ptdf_obl, 0.0)  # (n_lines, n_bids)
+
+    # ── 2. Objective ──────────────────────────────────────────────────────────
+    is_buy = bids["side"].values == "BUY"          # (n_bids,) bool
+    prices = bids["bid_price"].values.astype(float)
+    c = np.where(is_buy, -prices, prices)          # linprog minimises
+
+    # ── 3. Baseload flows ─────────────────────────────────────────────────────
+    baseload_flow = np.zeros(n_lines)
+    if baseload_crrs:
+        for item in baseload_crrs:
+            src, snk, mw = item[:3]
+            snk_inj = _settlement_point_injection(snk, settlement_points, bus_list, bus_idx)
+            src_inj = _settlement_point_injection(src, settlement_points, bus_list, bus_idx)
+            baseload_flow += mw * (ptdf @ (snk_inj - src_inj))
+
+    # ── 4. SFT constraint matrix — fully vectorized ───────────────────────────
+    # For each bid i and line l, the forward / reverse capacity consumed:
+    #   BUY  OBL: A_fwd = +ptdf_obl,  A_rev = -ptdf_obl
+    #   SELL OBL: A_fwd = -ptdf_obl,  A_rev = +ptdf_obl
+    #   BUY  OPT: A_fwd = +ptdf_opt,  A_rev = 0
+    #   SELL OPT: A_fwd = -ptdf_opt,  A_rev = 0
+    is_obl = bids["crr_type"].values == "OBL"      # (n_bids,) bool
+    sign   = np.where(is_buy, 1.0, -1.0)           # (n_bids,)
+
+    # Select ptdf_obl or ptdf_opt per column, then scale by sign
+    A_fwd = np.where(is_obl, ptdf_obl, ptdf_opt) * sign   # (n_lines, n_bids)
+    A_rev = np.where(is_obl, -ptdf_obl * sign, 0.0)        # (n_lines, n_bids)
+
+    # Interleave rows: [line0_fwd, line0_rev, line1_fwd, line1_rev, ...]
+    A_ub = np.empty((2 * n_lines, n_bids))
+    A_ub[0::2] = A_fwd
+    A_ub[1::2] = A_rev
+
+    eff_limits = capacity_factor * np.array(
+        [lines[l]["flow_limit"] for l in line_list])  # (n_lines,)
+    b_ub = np.empty(2 * n_lines)
+    b_ub[0::2] = eff_limits - baseload_flow   # forward: F_l - base[l]
+    b_ub[1::2] = eff_limits + baseload_flow   # reverse: F_l + base[l]
+
+    # Row indices match clear_auction: fwd = 2*l, rev = 2*l+1
+    line_row_idx = {lid: (2 * li, 2 * li + 1) for li, lid in enumerate(line_list)}
+
+    # ── 5. Bounds ─────────────────────────────────────────────────────────────
+    bounds = list(zip(np.zeros(n_bids), bids["mw"].values.astype(float)))
+
+    # ── 6. Solve ──────────────────────────────────────────────────────────────
+    res = linprog(c=c, A_ub=A_ub, b_ub=b_ub, bounds=bounds,
+                  method="highs", options={"disp": False})
+
+    if res.status != 0:
+        return {"status": res.message}
+
+    # ── 7. Duals — vectorized extraction ─────────────────────────────────────
+    awarded_df = bids.copy()
+    awarded_df["mw_awarded"] = res.x
+
+    ineq_duals  = res.ineqlin.marginals
+    mu_fwd_arr  = -ineq_duals[0::2]           # (n_lines,)  forward constraint duals
+    mu_rev_arr  = -ineq_duals[1::2]           # (n_lines,)  reverse constraint duals
+    mu_net_arr  = mu_fwd_arr - mu_rev_arr     # (n_lines,)
+
+    line_duals = {
+        lid: {"forward": float(mu_fwd_arr[li]),
+              "reverse": float(mu_rev_arr[li]),
+              "net":     float(mu_net_arr[li])}
+        for li, lid in enumerate(line_list)
+    }
+    binding_lines = [l for l, d in line_duals.items()
+                     if abs(d["forward"]) > 0.01 or abs(d["reverse"]) > 0.01]
+
+    # ── 8. Bus and SP shadows — one matmul each ───────────────────────────────
+    # bus_shadow[b] = Σ_l mu_net[l] * PTDF[l,b]
+    bus_shadow_arr = mu_net_arr @ ptdf                         # (n_bus,)
+    bus_shadow = {b: float(bus_shadow_arr[bi])
+                  for bi, b in enumerate(bus_list)}
+
+    # SP shadows: batch all injection vectors into one matrix multiply
+    sp_names   = list(settlement_points.keys())
+    sp_inj_mat = np.zeros((len(sp_names), n_bus))
+    for si, sp_name in enumerate(sp_names):
+        sp_inj_mat[si] = _settlement_point_injection(
+            sp_name, settlement_points, bus_list, bus_idx)
+    sp_shadow_arr = sp_inj_mat @ bus_shadow_arr                # (n_sp,)
+    sp_shadow = {sp_name: float(sp_shadow_arr[si])
+                 for si, sp_name in enumerate(sp_names)}
+
+    # ── 9. Clearing prices by path and type ───────────────────────────────────
+    # OPT ACP for all bids in one matmul: mu_fwd @ ptdf_opt → (n_bids,)
+    opt_acp_per_bid = mu_fwd_arr @ ptdf_opt                    # (n_bids,)
+
+    acp_by_path = {}
+    for k in range(n_bids):
+        key = (source_names[k], sink_names[k], bids.at[k, "crr_type"])
+        if key not in acp_by_path:
+            if key[2] == "OBL":
+                acp_by_path[key] = (sp_shadow.get(key[1], 0.0)
+                                    - sp_shadow.get(key[0], 0.0))
+            else:
+                acp_by_path[key] = float(opt_acp_per_bid[k])
+
+    awarded_df["clearing_price"] = awarded_df.apply(
+        lambda r: acp_by_path.get((r["source"], r["sink"], r["crr_type"]), 0.0),
+        axis=1,
+    )
+
+    # ── 10. Summary ───────────────────────────────────────────────────────────
+    summary = {}
+    for side in ["BUY", "SELL"]:
+        for ctype in ["OBL", "OPT"]:
+            mask   = (awarded_df["side"] == side) & (awarded_df["crr_type"] == ctype)
+            subset = awarded_df[mask]
+            key    = f"{side.lower()}_{ctype.lower()}"
+            summary[f"{key}_mw"] = float(subset["mw_awarded"].sum())
+            summary[f"{key}_n"]  = int((subset["mw_awarded"] > 0.01).sum())
 
     return {
         "status":        "optimal",
