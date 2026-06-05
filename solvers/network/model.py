@@ -119,6 +119,10 @@ class NetworkModel:
     ptdf: np.ndarray = field(init=False)
     lodf: np.ndarray = field(init=False)
     contingency_ptdf: Dict[str, np.ndarray] = field(init=False)
+    # Pre-stacked tensor for vectorised N-1 screening — shape (n_ctg, n_line, n_bus).
+    # ctg_id_list gives the contingency ordering that matches the tensor rows.
+    ctg_id_list: List[str] = field(init=False)
+    contingency_ptdf_tensor: np.ndarray = field(init=False)
 
     def __post_init__(self):
         self.bus_list = sorted(self.buses.keys())
@@ -129,6 +133,14 @@ class NetworkModel:
         self.ptdf = self._build_ptdf()
         self.lodf = self._build_lodf()
         self.contingency_ptdf = self._build_contingency_ptdfs()
+        # Build stacked tensor once so screening never calls np.stack per iteration
+        self.ctg_id_list = sorted(self.contingency_ptdf.keys())
+        if self.ctg_id_list:
+            self.contingency_ptdf_tensor = np.stack(
+                [self.contingency_ptdf[c] for c in self.ctg_id_list]
+            )
+        else:
+            self.contingency_ptdf_tensor = np.empty((0, self.n_line, self.n_bus))
 
     def _build_ptdf(self) -> np.ndarray:
         B = np.zeros((self.n_bus, self.n_bus))
